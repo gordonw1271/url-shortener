@@ -1,13 +1,29 @@
+import logging
+import sys
 from contextlib import asynccontextmanager
+
+# Uvicorn only configures its own loggers (`uvicorn`, `uvicorn.access`). Our
+# `app.*` loggers default to WARNING, so cache HIT/MISS lines never show up.
+# Attach an INFO-level stdout handler to the whole `app` namespace.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    _app_logger.addHandler(_h)
+_app_logger.setLevel(logging.INFO)
+_app_logger.propagate = False
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from . import cache
 from .db import Base, SessionLocal, engine, get_session
 from .encoding import encode
 from .models import Click, URLMapping
 from .schemas import ClickRecord, ShortenRequest, ShortenResponse, StatsResponse
+
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -17,11 +33,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="URL Shortener — Phase 2",
+    title="URL Shortener — Phase 3",
     description=(
-        "FastAPI + SQLite, base62 counter codes, with split analytics: every "
-        "redirect fires a fire-and-forget click write so the 302 is never "
-        "blocked by an analytics INSERT."
+        "FastAPI + SQLite + Redis read-through cache. The redirect path tries "
+        "Redis first; on miss it falls back to the DB and populates the cache. "
+        "Cache failures degrade gracefully — Redis is an optimization, not a "
+        "dependency."
     ),
     lifespan=lifespan,
 )
@@ -51,19 +68,27 @@ def shorten(
 
 
 def _record_click(
-    mapping_id: int,
+    short_code: str,
     ip: str | None,
     user_agent: str | None,
     referer: str | None,
 ) -> None:
     # Runs AFTER the 302 has been sent. Opens its own session because the
-    # request-scoped session is already closed by then. If this insert fails,
-    # the user has already been redirected — analytics drift, no user impact.
+    # request-scoped session is already closed by then. Looks up mapping_id
+    # by short_code so the redirect handler doesn't need to do a DB SELECT
+    # on cache HIT just to satisfy the click write.
     db = SessionLocal()
     try:
+        row = (
+            db.query(URLMapping)
+            .filter(URLMapping.short_code == short_code)
+            .one_or_none()
+        )
+        if row is None:
+            return
         db.add(
             Click(
-                mapping_id=mapping_id,
+                mapping_id=row.id,
                 ip=ip,
                 user_agent=user_agent,
                 referer=referer,
@@ -103,18 +128,29 @@ def redirect(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_session),
 ) -> RedirectResponse:
-    row = db.query(URLMapping).filter(URLMapping.short_code == short_code).one_or_none()
-    if row is None:
-        raise HTTPException(status_code=404, detail="short code not found")
+    long_url = cache.get(short_code)
+    if long_url is not None:
+        log.info("cache HIT  %s", short_code)
+    else:
+        row = (
+            db.query(URLMapping)
+            .filter(URLMapping.short_code == short_code)
+            .one_or_none()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="short code not found")
+        long_url = row.long_url
+        cache.put(short_code, long_url)
+        log.info("cache MISS %s (populated)", short_code)
 
     background_tasks.add_task(
         _record_click,
-        mapping_id=row.id,
+        short_code=short_code,
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
         referer=request.headers.get("referer"),
     )
 
-    # 302 (not 301): browsers don't cache it, so every click hits the server.
-    # Phase 2 leverages this — every hit becomes one row in `clicks`.
-    return RedirectResponse(url=row.long_url, status_code=302)
+    # 302 (not 301): browsers don't cache it, so every click reaches us and
+    # gets recorded in `clicks`.
+    return RedirectResponse(url=long_url, status_code=302)
