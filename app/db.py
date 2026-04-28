@@ -1,18 +1,20 @@
-from pathlib import Path
+import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "shortener.db"
-
-# check_same_thread=False: FastAPI/Starlette runs sync endpoints in a thread
-# pool, so a single SQLAlchemy connection may be touched from multiple threads.
-engine = create_engine(
-    f"sqlite:///{DB_PATH}",
-    connect_args={"check_same_thread": False},
+# Phase 4 swaps SQLite for Postgres. Everything else stays the same — the
+# whole point of using SQLAlchemy from Phase 1 was to make this change a
+# one-line connection-string swap.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://shortener:shortener@localhost:5432/shortener",
 )
+
+# pool_pre_ping: SQLAlchemy tests the connection before handing it out.
+# Cheap insurance against stale connections (e.g. after `docker compose
+# restart postgres`).
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

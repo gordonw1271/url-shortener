@@ -6,66 +6,77 @@ solution](https://systemdesignschool.io/problems/url-shortener/solution).
 
 | Phase | Status | Adds |
 |---|---|---|
-| 1. MVP | ✅ done | FastAPI + SQLite, base62 counter encoding, sqlite-web for DB visibility |
-| 2. Analytics split | ✅ done | Separate `clicks` table, fire-and-forget writes on redirect, `GET /stats/{code}` |
-| **3. Cache** | ✅ current | Redis read-through cache, docker-compose, graceful degradation |
-| 4. Sharding sim | planned | Postgres + machine-ID prefix, two app replicas behind nginx |
+| 1. MVP | ✅ done | FastAPI + SQLite, base62 counter encoding |
+| 2. Analytics split | ✅ done | Separate `clicks` table, fire-and-forget writes on redirect |
+| 3. Cache | ✅ done | Redis read-through cache, graceful degradation |
+| **4. Sharding sim** | ✅ current | Postgres + machine-ID prefix, two app replicas behind nginx |
 | 5. Polish | planned | Dockerfile, tests, CI, architecture diagrams |
 
 ## What's here
 
-- `POST /shorten` — accepts a long URL, returns a short code
-- `GET /{short_code}` — read-through Redis cache → DB on miss → 302 redirect → background click write
-- `GET /stats/{short_code}` — returns total clicks + 10 most recent (timestamp, IP, user-agent, referer)
-- SQLite at `data/shortener.db` with two tables: `url_mappings`, `clicks`
-- Redis on port 6379 (containerized), redis-commander UI on port 8082
-- Swagger UI at `/docs`, sqlite-web at 8081, redis-commander at 8082
+- `POST /shorten` — mints a short code prefixed with this instance's `MACHINE_ID`
+- `GET /{short_code}` — read-through Redis cache → Postgres on miss → 302 redirect → background click write
+- `GET /stats/{short_code}` — total clicks + 10 most recent (timestamp, IP, user-agent, referer)
+- **Postgres** holds `url_mappings` + `clicks` + per-machine `seq_<id>` sequences
+- **Redis** caches `mapping:<code>` → long URL with 1-day TTL
+- **nginx** on port 8000 round-robins POSTs across two `uvicorn` instances on 8001 and 8002
+- Swagger UI per instance at `/docs`; cache UI at 8082, DB UI at 8083
 
 ### Design choices
 
-**Base62 counter encoding.** The DB's auto-increment `id` is the counter; the
-short code is `base62(id)`. This is collision-free by construction — no hash
-collisions to handle, no retry loops. Tradeoff: short codes are sequential
-and guessable, which leaks how many URLs you've shortened. Real shorteners
-add a random offset or scramble the counter; we'll ignore that for now.
+**(Phase 1) Base62 counter encoding.** A counter (auto-increment in Phase 1,
+per-machine sequence in Phase 4) is encoded into a URL-safe alphanumeric
+string. Collision-free by construction — no hash collisions to handle, no
+retry loops. Tradeoff: short codes are sequential and guessable, which leaks
+how many URLs you've shortened.
 
-**302 instead of 301 redirects.** A 301 (permanent) is cached aggressively by
-browsers, so subsequent clicks bypass the server. Phase 2 needs every click
-to hit us so we can record analytics, so 302 sets us up for that.
+**(Phase 1) 302 instead of 301 redirects.** A 301 (permanent) is cached
+aggressively by browsers, so subsequent clicks bypass the server. We need
+every click to reach us so the analytics row gets written. 302 is non-cached.
 
-**SQLite + SQLAlchemy.** SQLite is a single file you can open in any tool;
-SQLAlchemy keeps the model code identical when we switch to Postgres in
-Phase 4. The point of Phase 1 is to **see the data** — sqlite-web makes
-every row visible.
+**(Phase 1) FastAPI + SQLAlchemy + SQLite.** FastAPI gives auto-generated
+Swagger UI at `/docs` so you can hand-drive every endpoint. SQLAlchemy keeps
+the ORM code identical when the connection string swaps from SQLite to
+Postgres in Phase 4. SQLite was the perfect day-one DB — a single file you
+could open in `sqlite-web` to *see the data* — and the only thing that
+changed in Phase 4 was the `DATABASE_URL`.
 
 **(Phase 2) Separate `clicks` table.** Redirects are read-heavy, analytics
 are write-heavy. Splitting them means a redirect's INSERT goes to a
 different table from the SELECT — no row-level contention, and we can scale
-them independently later (e.g. send clicks to a queue, or to a different
-DB). One row per click — richer than a counter, and Phase 3's cache demo
-gets more interesting when popular URLs accumulate lots of click rows.
+them independently later. One row per click (richer than a counter).
 
 **(Phase 2) Fire-and-forget click writes.** The redirect handler returns
 the 302 *before* the click row is written. FastAPI's `BackgroundTasks`
-schedules the INSERT to run after the response is sent. Tradeoff: if the
-process crashes between response and INSERT, that click is lost. For a
-URL shortener, that's fine — analytics are best-effort, not transactional.
+schedules the INSERT to run after the response is sent. Tradeoff: a crash
+between response and INSERT loses one click. Acceptable for analytics;
+unacceptable for billing.
 
-**(Phase 3) Read-through Redis cache.** The redirect handler asks Redis
-first (`mapping:{code}` -> long URL). On miss it falls back to the DB and
-populates the cache for the next caller. Mappings are immutable, so no
-invalidation is needed — we set a 1-day TTL anyway to evict cold entries.
+**(Phase 3) Read-through Redis cache.** Redirect handler asks Redis first
+(`mapping:{code}` → long URL). On miss it reads Postgres and populates the
+cache. Mappings are immutable, so no invalidation needed — we still set a
+1-day TTL to evict cold entries.
 
 **(Phase 3) Graceful degradation.** Every Redis call is wrapped in
-try/except. If Redis is down, the cache call returns `None`/no-op and the
-handler reads from the DB. The app keeps working; only latency suffers.
+try/except. If Redis is down, latency degrades but the app keeps working.
 Cache is an optimization, never a hard dependency.
 
 **(Phase 3) Read-through, not write-through.** We don't pre-populate the
 cache when a URL is shortened — only when it's first *clicked*. Most
-shortened URLs are never clicked, so write-through wastes Redis memory on
-cold entries. You'll see this clearly in the logs: first click on a code
-is a `MISS`, subsequent clicks are `HIT`s.
+shortened URLs are never clicked, so write-through wastes memory.
+
+**(Phase 4) Machine-ID prefix.** Each instance has a single-character
+`MACHINE_ID` (`a`, `b`, ...). Short codes are `MACHINE_ID + base62(seq)`,
+where `seq` comes from a Postgres `SEQUENCE` named per machine
+(`seq_a`, `seq_b`). Two writers mint codes in disjoint keyspaces — no
+distributed lock, no central counter. The prefix also doubles as a
+"shard key": in real systems with physically separate DBs, the first
+character of the short code tells you which shard owns it.
+
+**(Phase 4) nginx round-robin.** A single entrypoint on port 8000 spreads
+load across both replicas. Either replica can serve any GET because they
+share Postgres + Redis (logical sharding — physical sharding would split
+the DB by prefix, kept as a future exercise).
 
 ## Run it
 
@@ -76,37 +87,42 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Three terminals (venv activated in 1 and 2):
+Then four terminals:
 
 ```bash
-# terminal 1 — the API
-uvicorn app.main:app --reload --port 8000
-
-# terminal 2 — the DB visualizer
-python -m sqlite_web --port 8081 data/shortener.db
-
-# terminal 3 — Redis + redis-commander (Docker)
+# terminal 1 — infra (postgres, redis, redis-commander, adminer, nginx)
 docker compose up
+
+# terminal 2 — instance "a" on port 8001  (Windows cmd)
+set MACHINE_ID=a&& uvicorn app.main:app --reload --port 8001
+
+# terminal 3 — instance "b" on port 8002
+set MACHINE_ID=b && uvicorn app.main:app --reload --port 8002
 ```
 
-- API + Swagger: <http://localhost:8000/docs>
-- DB visualizer (sqlite-web): <http://localhost:8081>
-- Cache visualizer (redis-commander): <http://localhost:8082>
-
-If you skip terminal 3, the app still works — every redirect just runs
-through the DB and you'll see `redis GET failed ... degrading to DB`
-warnings in the uvicorn log. That's the graceful-degradation story.
+| URL | What it is |
+|---|---|
+| <http://localhost:8000/docs> | API via nginx (round-robins between A and B) |
+| <http://localhost:8001/docs> | Direct hit on instance A |
+| <http://localhost:8002/docs> | Direct hit on instance B |
+| <http://localhost:8082> | redis-commander (cache visualizer) |
+| <http://localhost:8083> | Adminer (Postgres viewer — server `postgres`, user/pwd/db all `shortener`) |
 
 ### Try it
 
-1. Open <http://localhost:8000/docs>, expand `POST /shorten`, click **Try it
-   out**, paste a URL, **Execute**.
-2. Copy the `short_code` from the response.
-3. Refresh sqlite-web — your row is in `url_mappings`.
-4. Visit `http://localhost:8000/<short_code>` in your browser address bar.
-   In the **uvicorn log** you'll see `cache MISS <code> (populated)` and
-   in **redis-commander** a new key `mapping:<code>` appears.
-5. Visit it again. Now the log shows `cache HIT  <code>` — the DB was
-   never touched. Refresh sqlite-web: `clicks` still got a new row, because
-   the click write is independent of the cache.
-6. Call `GET /stats/<short_code>` from `/docs` to see the click count.
+1. POST `/shorten` to <http://localhost:8000/shorten> a few times. Watch the
+   short codes alternate prefixes — `a1`, `b1`, `a2`, `b2`, ... — proving
+   nginx round-robins and each instance pulls from its own counter.
+2. In Adminer, browse `url_mappings` to see all rows in one Postgres DB,
+   and run `SELECT * FROM information_schema.sequences` to see `seq_a` and
+   `seq_b`.
+3. Hit a short URL through nginx (`http://localhost:8000/<code>`) — either
+   instance can serve it. Watch both uvicorn terminals: only one logs the
+   request.
+4. Stop one of the uvicorn instances. Keep hitting nginx. Requests still
+   succeed (nginx routes around the dead upstream). That's the load-
+   balancer-as-failover bonus lesson.
+
+If you skip Docker entirely, the app won't start (Postgres isn't optional in
+Phase 4). Redis is still optional — kill its container and you'll just see
+`degrading to DB` warnings.

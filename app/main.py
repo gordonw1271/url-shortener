@@ -1,6 +1,18 @@
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from . import cache
+from .db import Base, SessionLocal, engine, get_session
+from .encoding import ALPHABET, encode
+from .models import Click, URLMapping
+from .schemas import ClickRecord, ShortenRequest, ShortenResponse, StatsResponse
 
 # Uvicorn only configures its own loggers (`uvicorn`, `uvicorn.access`). Our
 # `app.*` loggers default to WARNING, so cache HIT/MISS lines never show up.
@@ -13,32 +25,38 @@ if not _app_logger.handlers:
 _app_logger.setLevel(logging.INFO)
 _app_logger.propagate = False
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-
-from . import cache
-from .db import Base, SessionLocal, engine, get_session
-from .encoding import encode
-from .models import Click, URLMapping
-from .schemas import ClickRecord, ShortenRequest, ShortenResponse, StatsResponse
-
 log = logging.getLogger(__name__)
+
+# Phase 4: every instance has a unique single-character ID. Short codes are
+# `MACHINE_ID + base62(per-machine-counter)`, so two instances mint codes in
+# disjoint keyspaces — no coordination required to avoid collisions.
+MACHINE_ID = os.getenv("MACHINE_ID", "a")
+if len(MACHINE_ID) != 1 or MACHINE_ID not in ALPHABET:
+    raise RuntimeError(
+        f"MACHINE_ID must be a single base62 character (got {MACHINE_ID!r})"
+    )
+
+SEQ_NAME = f"seq_{MACHINE_ID}"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        # Per-machine Postgres SEQUENCE. Each instance pulls from its own;
+        # nextval() is atomic, so two writers on the same instance still
+        # serialize correctly, and instances never see each other's counter.
+        conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {SEQ_NAME}"))
+    log.info("instance MACHINE_ID=%s ready (sequence=%s)", MACHINE_ID, SEQ_NAME)
     yield
 
 
 app = FastAPI(
-    title="URL Shortener — Phase 3",
+    title=f"URL Shortener — Phase 4 (instance {MACHINE_ID})",
     description=(
-        "FastAPI + SQLite + Redis read-through cache. The redirect path tries "
-        "Redis first; on miss it falls back to the DB and populates the cache. "
-        "Cache failures degrade gracefully — Redis is an optimization, not a "
-        "dependency."
+        f"This instance prefixes every short code with `{MACHINE_ID}`. nginx "
+        "(port 8000) round-robins POSTs across two instances; either instance "
+        "can serve any GET because they share Postgres + Redis."
     ),
     lifespan=lifespan,
 )
@@ -50,12 +68,13 @@ def shorten(
     request: Request,
     db: Session = Depends(get_session),
 ) -> ShortenResponse:
-    row = URLMapping(long_url=str(payload.url))
+    # Pull the next per-machine sequence value, then prefix with MACHINE_ID
+    # to produce a globally unique short code without coordinating with the
+    # other instance.
+    seq = db.execute(text(f"SELECT nextval('{SEQ_NAME}')")).scalar()
+    short_code = MACHINE_ID + encode(seq)
+    row = URLMapping(short_code=short_code, long_url=str(payload.url))
     db.add(row)
-    # flush() sends the INSERT and populates row.id without committing — we
-    # need the id to compute the short_code, then commit both in one txn.
-    db.flush()
-    row.short_code = encode(row.id)
     db.commit()
     db.refresh(row)
 
@@ -73,10 +92,6 @@ def _record_click(
     user_agent: str | None,
     referer: str | None,
 ) -> None:
-    # Runs AFTER the 302 has been sent. Opens its own session because the
-    # request-scoped session is already closed by then. Looks up mapping_id
-    # by short_code so the redirect handler doesn't need to do a DB SELECT
-    # on cache HIT just to satisfy the click write.
     db = SessionLocal()
     try:
         row = (
@@ -130,7 +145,7 @@ def redirect(
 ) -> RedirectResponse:
     long_url = cache.get(short_code)
     if long_url is not None:
-        log.info("cache HIT  %s", short_code)
+        log.info("cache HIT  %s (served by %s)", short_code, MACHINE_ID)
     else:
         row = (
             db.query(URLMapping)
@@ -141,7 +156,7 @@ def redirect(
             raise HTTPException(status_code=404, detail="short code not found")
         long_url = row.long_url
         cache.put(short_code, long_url)
-        log.info("cache MISS %s (populated)", short_code)
+        log.info("cache MISS %s (populated, served by %s)", short_code, MACHINE_ID)
 
     background_tasks.add_task(
         _record_click,
@@ -151,6 +166,4 @@ def redirect(
         referer=request.headers.get("referer"),
     )
 
-    # 302 (not 301): browsers don't cache it, so every click reaches us and
-    # gets recorded in `clicks`.
     return RedirectResponse(url=long_url, status_code=302)
