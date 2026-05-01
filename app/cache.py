@@ -16,7 +16,6 @@ user-facing failure. The cache is an optimization, not a dependency.
 """
 import logging
 import os
-from typing import Optional
 
 import redis
 
@@ -35,7 +34,7 @@ def _key(short_code: str) -> str:
     return f"mapping:{short_code}"
 
 
-def get(short_code: str) -> Optional[str]:
+def get(short_code: str) -> str | None:
     """Return the cached long URL, or None on miss / Redis error."""
     try:
         return _client.get(_key(short_code))

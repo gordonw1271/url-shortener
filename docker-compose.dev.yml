@@ -1,0 +1,59 @@
+# Dev-mode infra: postgres + redis + viewers + nginx, but NO app containers.
+# Run uvicorn on the host (with --reload) so editing app/ rebuilds instantly.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   set MACHINE_ID=a && uvicorn app.main:app --reload --port 8001
+#   set MACHINE_ID=b && uvicorn app.main:app --reload --port 8002
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener
+      POSTGRES_DB: shortener
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8082:8081"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  adminer:
+    image: adminer:latest
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8083:8080"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx.dev.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      # Lets nginx in the container reach uvicorn running on the Windows host.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
