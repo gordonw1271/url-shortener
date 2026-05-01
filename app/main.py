@@ -30,7 +30,8 @@ log = logging.getLogger(__name__)
 # Phase 4: every instance has a unique single-character ID. Short codes are
 # `MACHINE_ID + base62(per-machine-counter)`, so two instances mint codes in
 # disjoint keyspaces — no coordination required to avoid collisions.
-MACHINE_ID = os.getenv("MACHINE_ID", "a")
+# `.strip()` because Windows `set FOO=x && ...` assigns "x " (trailing space).
+MACHINE_ID = os.getenv("MACHINE_ID", "a").strip()
 if len(MACHINE_ID) != 1 or MACHINE_ID not in ALPHABET:
     raise RuntimeError(
         f"MACHINE_ID must be a single base62 character (got {MACHINE_ID!r})"

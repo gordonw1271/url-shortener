@@ -23,19 +23,24 @@ documented so the *why* is reviewable from the README.
 
 ```mermaid
 flowchart LR
-    Client([Browser / curl])
-    Client -->|:8000| Nginx[nginx<br/>load balancer]
+    Client(["Browser / curl"])
+    Nginx["nginx :8000<br/>load balancer"]
+    AppA["Replica A<br/>(MACHINE_ID a)"]
+    AppB["Replica B<br/>(MACHINE_ID b)"]
+    Redis[("Redis cache")]
+    PG[("Postgres<br/>url_mappings, clicks<br/>seq_a, seq_b")]
+    Adminer["Adminer :8083"]
+    RC["redis-commander :8082"]
 
-    Nginx -->|round-robin| AppA[FastAPI replica A<br/>MACHINE_ID=a]
-    Nginx -->|round-robin| AppB[FastAPI replica B<br/>MACHINE_ID=b]
-
-    AppA --> Redis[(Redis<br/>cache)]
+    Client --> Nginx
+    Nginx -->|round-robin| AppA
+    Nginx -->|round-robin| AppB
+    AppA --> Redis
     AppB --> Redis
-    AppA --> PG[(Postgres<br/>url_mappings · clicks<br/>seq_a · seq_b)]
+    AppA --> PG
     AppB --> PG
-
-    Adminer[Adminer :8083] -.-> PG
-    RC[redis-commander :8082] -.-> Redis
+    Adminer -.-> PG
+    RC -.-> Redis
 ```
 
 ### Write path — `POST /shorten`

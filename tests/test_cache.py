@@ -23,12 +23,15 @@ def test_put_then_get(fake):
 
 def test_put_sets_default_ttl(fake):
     cache.put("a1", "https://example.com")
-    assert fake.ttl("mapping:a1") == cache.CACHE_TTL_SECONDS
+    ttl = fake.ttl("mapping:a1")
+    # SETEX stores whole seconds, so a wall-clock tick between put() and
+    # ttl() can shave one off. Allow a small tolerance.
+    assert cache.CACHE_TTL_SECONDS - 2 <= ttl <= cache.CACHE_TTL_SECONDS
 
 
 def test_put_custom_ttl(fake):
     cache.put("a1", "https://example.com", ttl=60)
-    assert fake.ttl("mapping:a1") == 60
+    assert 58 <= fake.ttl("mapping:a1") <= 60
 
 
 def test_key_namespacing(fake):
